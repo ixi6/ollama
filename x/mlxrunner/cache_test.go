@@ -208,6 +208,11 @@ func (c *fakeSlidingWindowCache) Restore(snapshot cache.Snapshot, target int) bo
 		return true
 	}
 	s := snapshot.(*fakeSnapshot)
+	// Reject if clamping would leave an incomplete window
+	// (matches RotatingKVCache behavior).
+	if target < s.to && s.to > c.maxSize {
+		return false
+	}
 	c.tokens = slices.Clone(s.tokens)
 	if target < len(c.tokens) {
 		c.tokens = c.tokens[:target]
@@ -294,9 +299,10 @@ type feedableCache interface {
 
 // testEnv encapsulates a kvCache and its fake caches for a test scenario.
 type testEnv struct {
-	kvc     *kvCache
-	caches  []cache.Cache // typed references for assertions
-	tracker *snapshotTracker
+	kvc        *kvCache
+	caches     []cache.Cache // typed references for assertions
+	tracker    *snapshotTracker
+	rewindable bool // true when all caches support arbitrary Restore(nil, target)
 }
 
 // newTransformerEnv creates a test environment with a single rewindable cache
@@ -305,23 +311,28 @@ func newTransformerEnv() *testEnv {
 	tracker := &snapshotTracker{}
 	caches := []cache.Cache{&fakeRewindableCache{tracker: tracker}}
 	return &testEnv{
-		kvc:     &kvCache{caches: caches},
-		caches:  caches,
-		tracker: tracker,
+		kvc:        &kvCache{caches: caches},
+		caches:     caches,
+		tracker:    tracker,
+		rewindable: true,
 	}
 }
 
 // newSlidingWindowEnv creates a test environment with one rewindable cache and
-// one sliding window cache (Mistral-style architecture).
+// one sliding window cache (Mistral-style architecture). The sliding window
+// maxSize is set small enough that test sequences fill it, making
+// Restore(nil, target) fail — the same behavior as production models where
+// the window fills after a few turns.
 func newSlidingWindowEnv() *testEnv {
 	tr := &snapshotTracker{}
 	rc := &fakeRewindableCache{tracker: tr}
-	sw := &fakeSlidingWindowCache{maxSize: 32, tracker: tr}
+	sw := &fakeSlidingWindowCache{maxSize: 4, tracker: tr}
 	caches := []cache.Cache{rc, sw}
 	return &testEnv{
-		kvc:     &kvCache{caches: caches},
-		caches:  caches,
-		tracker: tr,
+		kvc:        &kvCache{caches: caches},
+		caches:     caches,
+		tracker:    tr,
+		rewindable: false,
 	}
 }
 
@@ -333,9 +344,10 @@ func newRecurrentEnv() *testEnv {
 	nrc := &fakeRecurrentCache{tracker: tr}
 	caches := []cache.Cache{rc, nrc}
 	return &testEnv{
-		kvc:     &kvCache{caches: caches},
-		caches:  caches,
-		tracker: tr,
+		kvc:        &kvCache{caches: caches},
+		caches:     caches,
+		tracker:    tr,
+		rewindable: false,
 	}
 }
 
@@ -590,15 +602,24 @@ func TestBranchCreationAndReuse(t *testing.T) {
 		}
 
 		// Request B: [1,2,3,4,5,10,11,12] — shares 5-token prefix with A.
-		// Partial match in A's edge triggers snapshotOffset.
+		// For rewindable caches, switchToPath rewinds to the match point
+		// so only the non-matching suffix needs evaluation. For non-rewindable
+		// caches (RecurrentCache), the rewind fails and freeAll fires.
 		resB := simulateRequest(t, kvc, []int32{1, 2, 3, 4, 5, 10, 11, 12}, []int32{30, 31})
-		if resB.snapshotOffset != 5 {
-			t.Fatalf("B: snapshotOffset = %d, want 5", resB.snapshotOffset)
-		}
-		// Cache was rewound to 0 (partial match truncates path to root),
-		// so all tokens were re-evaluated.
-		if len(resB.remaining) != 8 {
-			t.Fatalf("B: remaining = %d, want 8", len(resB.remaining))
+		if env.rewindable {
+			if resB.snapshotOffset != 0 {
+				t.Fatalf("B: snapshotOffset = %d, want 0 (rewind succeeded)", resB.snapshotOffset)
+			}
+			if len(resB.remaining) != 3 {
+				t.Fatalf("B: remaining = %d, want 3 (rewind to match point)", len(resB.remaining))
+			}
+		} else {
+			if resB.snapshotOffset != 5 {
+				t.Fatalf("B: snapshotOffset = %d, want 5", resB.snapshotOffset)
+			}
+			if len(resB.remaining) != 8 {
+				t.Fatalf("B: remaining = %d, want 8 (freeAll fallback)", len(resB.remaining))
+			}
 		}
 		env.assertAllTokens(t, "after B", []int32{1, 2, 3, 4, 5, 10, 11, 12, 30, 31})
 
@@ -635,14 +656,24 @@ func TestExactMatchSeedBehavior(t *testing.T) {
 		simulateRequest(t, kvc, []int32{1, 2, 3, 4, 5}, []int32{10, 11})
 
 		// Request B: identical prompt. Holdback means matched=4, partial in
-		// the 5-token edge, so path truncates to root and all tokens are
-		// re-evaluated. snapshotOffset should be set at the holdback point.
+		// the 5-token edge. For rewindable caches, switchToPath rewinds to
+		// offset 4, so only the held-back token needs re-evaluation. For
+		// non-rewindable caches, the rewind fails and freeAll fires.
 		resB := simulateRequest(t, kvc, []int32{1, 2, 3, 4, 5}, []int32{20, 21})
-		if len(resB.remaining) != 5 {
-			t.Fatalf("B: remaining = %d, want 5 (full re-eval due to holdback)", len(resB.remaining))
-		}
-		if resB.snapshotOffset != 4 {
-			t.Fatalf("B: snapshotOffset = %d, want 4", resB.snapshotOffset)
+		if env.rewindable {
+			if len(resB.remaining) != 1 {
+				t.Fatalf("B: remaining = %d, want 1 (rewind to holdback point)", len(resB.remaining))
+			}
+			if resB.snapshotOffset != 0 {
+				t.Fatalf("B: snapshotOffset = %d, want 0 (rewind succeeded)", resB.snapshotOffset)
+			}
+		} else {
+			if len(resB.remaining) != 5 {
+				t.Fatalf("B: remaining = %d, want 5 (freeAll fallback)", len(resB.remaining))
+			}
+			if resB.snapshotOffset != 4 {
+				t.Fatalf("B: snapshotOffset = %d, want 4", resB.snapshotOffset)
+			}
 		}
 		env.assertAllTokens(t, "after B", []int32{1, 2, 3, 4, 5, 20, 21})
 
